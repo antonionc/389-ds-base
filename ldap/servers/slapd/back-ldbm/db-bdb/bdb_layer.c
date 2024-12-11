@@ -7,12 +7,12 @@
  * END COPYRIGHT BLOCK **/
 
 
-#include <sys/types.h>
-#include <sys/statvfs.h>
 #ifdef HAVE_CONFIG_H
 #include <config.h>
 #endif
 #include "bdb_layer.h"
+#include <sys/types.h>
+#include <sys/statvfs.h>
 #include <prthread.h>
 #include <prclist.h>
 #include <glob.h>
@@ -1047,7 +1047,7 @@ bdb_start(struct ldbminfo *li, int dbmode)
     slapi_pal_meminfo *mi = spal_meminfo_get();
     util_cachesize_result result = util_is_cachesize_sane(mi, &(conf->bdb_cachesize));
     if (result == UTIL_CACHESIZE_ERROR) {
-        slapi_log_err(SLAPI_LOG_CRIT, "bdb_start", "Unable to determine if cachesize was valid!!!");
+        slapi_log_err(SLAPI_LOG_CRIT, "bdb_start", "Unable to determine if cachesize was valid!!!\n");
     } else if (result == UTIL_CACHESIZE_REDUCED) {
         /* In some cases we saw this go to 0, prevent this. */
         if (conf->bdb_cachesize < MINCACHESIZE) {
@@ -4772,7 +4772,7 @@ bdb_copyfile(char *source, char *destination, int overwrite __attribute__((unuse
     int dest_fd = -1;
     char *buffer = NULL;
     int return_value = -1;
-    int bytes_to_write = 0;
+    size_t bytes_to_write = 0;
 
     /* malloc the buffer */
     buffer = slapi_ch_malloc(64 * 1024);
@@ -4817,12 +4817,12 @@ bdb_copyfile(char *source, char *destination, int overwrite __attribute__((unuse
                 break;
             } else {
                 /* means error */
-                slapi_log_err(SLAPI_LOG_ERR, "bdb_copyfile", "Failed to write by \"%s\"; real: %d bytes, exp: %d bytes\n",
+                slapi_log_err(SLAPI_LOG_ERR, "bdb_copyfile", "Failed to write by \"%s\"; real: %d bytes, exp: %lu bytes\n",
                               strerror(errno), return_value, bytes_to_write);
                 if (return_value > 0) {
                     bytes_to_write -= return_value;
                     ptr += return_value;
-                    slapi_log_err(SLAPI_LOG_NOTICE, "bdb_copyfile", "Retrying to write %d bytes\n", bytes_to_write);
+                    slapi_log_err(SLAPI_LOG_NOTICE, "bdb_copyfile", "Retrying to write %lu bytes\n", bytes_to_write);
                 } else {
                     break;
                 }
@@ -5591,6 +5591,28 @@ bdb_restore(struct ldbminfo *li, char *src_dir, Slapi_Task *task)
     /* Otherwise use the src_dir from the caller */
     real_src_dir = src_dir;
 
+    /* Lets remove existing log files before copying the new ones (See issue #6386) */
+    prefix = BDB_CONFIG(li)->bdb_log_directory;
+    if (prefix == NULL) {
+        prefix = home_dir;
+    }
+    dirhandle = PR_OpenDir(prefix);
+    if (NULL != dirhandle) {
+        while (NULL !=
+               (direntry = PR_ReadDir(dirhandle, PR_SKIP_DOT | PR_SKIP_DOT_DOT))) {
+            if (NULL == direntry->name) {
+                /* NSPR doesn't behave like the docs say it should */
+                break;
+            }
+            if (bdb_is_logfilename(direntry->name)) {
+                PR_snprintf(filename1, sizeof(filename2), "%s/%s",
+                            prefix, direntry->name);
+                unlink(filename1);
+            }
+        }
+    }
+    PR_CloseDir(dirhandle);
+
     /* We copy the files over from the staging area */
     /* We want to treat the logfiles specially: if there's
      * a log file directory configured, copy the logfiles there
@@ -5713,14 +5735,14 @@ bdb_restore(struct ldbminfo *li, char *src_dir, Slapi_Task *task)
         slapi_log_err(SLAPI_LOG_ERR,
                       "bdb_restore", "%s is on, while the instance %s is in the DN format. "
                                          "Please run dn2rdn to convert the database format.\n",
-                      CONFIG_ENTRYRDN_SWITCH, inst->inst_name);
+                      CONFIG_ENTRYRDN_SWITCH, (inst != NULL) ? inst->inst_name : "<Null>");
         return_value = -1;
         goto error_out;
     } else if (action & DBVERSION_NEED_RDN2DN) {
         slapi_log_err(SLAPI_LOG_ERR,
                       "bdb_restore", "%s is off, while the instance %s is in the RDN format. "
                                          "Please change the value to on in dse.ldif.\n",
-                      CONFIG_ENTRYRDN_SWITCH, inst->inst_name);
+                      CONFIG_ENTRYRDN_SWITCH, (inst != NULL) ? inst->inst_name : "<Null>");
         return_value = -1;
         goto error_out;
     } else {
@@ -5783,20 +5805,27 @@ error_out:
 }
 
 static char *
-bdb__import_file_name(ldbm_instance *inst)
+bdb_import_file_name(ldbm_instance *inst)
 {
-    char *fname = slapi_ch_smprintf("%s/.import_%s",
-                                    inst->inst_parent_dir_name,
-                                    inst->inst_dir_name);
-    slapi_log_err(SLAPI_LOG_DEBUG, "bdb__import_file_name", "DBG: fname=%s\n", fname);
+    struct ldbminfo *li = inst->inst_li;
+    char *fname = slapi_ch_smprintf("%s/.import_%s", li->li_directory, inst->inst_name);
+    slapi_log_err(SLAPI_LOG_DEBUG, "bdb_import_file_name", "DBG: fname=%s\n", fname);
     return fname;
 }
 
 static char *
 bdb_restore_file_name(struct ldbminfo *li)
 {
-    char *fname = slapi_ch_smprintf("%s/../.restore", li->li_directory);
-
+    char *pt = strrchr(li->li_directory, '/');
+    char *fname =  NULL;
+    if (pt == NULL) {
+        fname = slapi_ch_strdup(".restore");
+    } else {
+        size_t len = pt-li->li_directory;
+        fname = slapi_ch_malloc(len+10);
+        strncpy(fname, li->li_directory, len);
+        strcpy(fname+len, "/.restore");
+    }
     return fname;
 }
 
@@ -5821,11 +5850,16 @@ bdb_import_file_init(ldbm_instance *inst)
 {
     int rc = -1;
     PRFileDesc *prfd = NULL;
-    char *fname = bdb__import_file_name(inst);
+    char *fname = bdb_import_file_name(inst);
     rc = bdb_file_open(fname, PR_RDWR | PR_CREATE_FILE | PR_TRUNCATE, inst->inst_li->li_mode, &prfd);
     if (prfd) {
         PR_Close(prfd);
         rc = 0;
+    }
+    if (rc) {
+        slapi_log_err(SLAPI_LOG_ERR,
+                      "bdb_import_file_init", "Failed to open file: %s, error: (%d) %s\n",
+                      fname, rc, slapd_pr_strerror(rc));
     }
     slapi_ch_free_string(&fname);
     return rc;
@@ -5849,7 +5883,7 @@ void
 bdb_import_file_update(ldbm_instance *inst)
 {
     PRFileDesc *prfd;
-    char *fname = bdb__import_file_name(inst);
+    char *fname = bdb_import_file_name(inst);
     bdb_file_open(fname, PR_RDWR, inst->inst_li->li_mode, &prfd);
 
     if (prfd) {
@@ -5899,7 +5933,7 @@ int
 bdb_import_file_check(ldbm_instance *inst)
 {
     int rc;
-    char *fname = bdb__import_file_name(inst);
+    char *fname = bdb_import_file_name(inst);
     rc = bdb_file_check(fname, inst->inst_li->li_mode);
     slapi_ch_free_string(&fname);
     return rc;
@@ -6887,45 +6921,64 @@ bdb_public_private_open(backend *be, const char *db_filename, int rw, dbi_env_t 
     bdb_config *conf = (bdb_config *)li->li_dblayer_config;
     bdb_db_env **ppEnv = (bdb_db_env**)&priv->dblayer_env;
     char dbhome[MAXPATHLEN];
+    bdb_db_env *pEnv = NULL;
     DB_ENV *bdb_env = NULL;
     DB *bdb_db = NULL;
     struct stat st = {0};
     int flags;
     int rc;
 
-    /* Either filename is an existing regular file
-     *  or the "home" directory where txn logs are
-     */
+    slapi_ch_free_string(&conf->bdb_dbhome_directory);
+    if (li->li_directory == NULL) {
+        /* Either filename is an existing regular file
+         *  or the "home" directory where txn logs are
+         */
 
-    PL_strncpyz(dbhome, db_filename, MAXPATHLEN);
-    if (stat(dbhome, &st) == 0) {
-        if (S_ISDIR(st.st_mode)) {
-            li->li_directory = slapi_ch_strdup(dbhome);
-        } else if (S_ISREG(st.st_mode)) {
-            getdir(dbhome, NULL);
-            li->li_directory = slapi_ch_strdup(db_filename);
-            getdir(dbhome, NULL);
+        PL_strncpyz(dbhome, db_filename, MAXPATHLEN);
+        if (stat(dbhome, &st) == 0) {
+            if (S_ISDIR(st.st_mode)) {
+                li->li_directory = slapi_ch_strdup(dbhome);
+            } else if (S_ISREG(st.st_mode)) {
+                getdir(dbhome, NULL);
+                li->li_directory = slapi_ch_strdup(db_filename);
+                getdir(dbhome, NULL);
+            } else {
+                fprintf(stderr, "bdb_public_private_open: Unable to determine dbhome from %s\n", db_filename);
+                return EINVAL;
+            }
         } else {
-            fprintf(stderr, "bdb_public_private_open: Unable to determine dbhome from %s\n", db_filename);
-            return EINVAL;
+            getdir(dbhome, NULL);
+            li->li_directory = slapi_ch_strdup(dbhome);
+            getdir(dbhome, NULL);
+            if (stat(dbhome, &st) || ((st.st_mode & S_IFMT) != S_IFDIR)) {
+                fprintf(stderr, "bdb_public_private_open: Unable to determine dbhome from %s\n", db_filename);
+                return EINVAL;
+            }
         }
+        conf->bdb_dbhome_directory = slapi_ch_strdup(dbhome);
     } else {
-        getdir(dbhome, NULL);
-        li->li_directory = slapi_ch_strdup(dbhome);
-        getdir(dbhome, NULL);
-        if (stat(dbhome, &st) || ((st.st_mode & S_IFMT) != S_IFDIR)) {
-            fprintf(stderr, "bdb_public_private_open: Unable to determine dbhome from %s\n", db_filename);
-            return EINVAL;
+        conf->bdb_dbhome_directory = slapi_ch_strdup(li->li_directory);
+        if (strcmp(li->li_directory, db_filename)) {
+            getdir(conf->bdb_dbhome_directory, NULL);
         }
     }
+
     li->li_config_mutex = PR_NewLock();
-    conf->bdb_dbhome_directory = slapi_ch_strdup(dbhome);
     if (rw) {
         /* Setup a fully transacted environment */
         priv->dblayer_env = NULL;
-        conf->bdb_enable_transactions = 0;
+        conf->bdb_enable_transactions = 1;
         conf->bdb_tx_max = 50;
         rc = bdb_start(li, DBLAYER_NORMAL_MODE);
+        if (rc == 0) {
+            pEnv = (bdb_db_env *)priv->dblayer_env;
+            if (pEnv == NULL) {
+                fprintf(stderr, "bdb_public_private_open: dbenv is not available (0x%p) for database %s\n",
+                        (void *)pEnv, db_filename ? db_filename : "unknown");
+                return EINVAL;
+            }
+            bdb_env = pEnv->bdb_DB_ENV;
+        }
     } else {
         /* Setup minimal environment */
         rc = db_env_create(&bdb_env, 0);
@@ -6956,18 +7009,40 @@ bdb_public_private_open(backend *be, const char *db_filename, int rw, dbi_env_t 
 }
 
 int
-bdb_public_private_close(dbi_env_t **env, dbi_db_t **db)
+bdb_public_private_close(struct ldbminfo *li, dbi_env_t **env, dbi_db_t **db)
 {
     DB_ENV *bdb_env = *env;
     DB *bdb_db = *db;
     int rc = 0;
+    int rw = 0;
+    dblayer_private *priv = li->li_dblayer_private;
+    bdb_config *conf = (bdb_config *)li->li_dblayer_config;
 
-    if (bdb_db) {
-        rc = bdb_db->close(bdb_db, 0);
+    if (priv) {
+        /* Detect if db is fully set up in read write mode */
+        bdb_db_env *pEnv = (bdb_db_env *)priv->dblayer_env;
+        if (pEnv) {
+            pthread_mutex_lock(&pEnv->bdb_thread_count_lock);
+            if (pEnv->bdb_thread_count > 0) {
+                rw = 1;
+            }
+            pthread_mutex_unlock(&pEnv->bdb_thread_count_lock);
+        }
     }
-    if (bdb_env) {
-        rc = bdb_env->close(bdb_env, 0);
+    if (rw == 0) {
+        if (bdb_db) {
+            rc = bdb_db->close(bdb_db, 0);
+        }
+        if (bdb_env) {
+            rc = bdb_env->close(bdb_env, 0);
+        }
+    } else {
+        rc = bdb_close(li, DBLAYER_NORMAL_MODE);
     }
+    slapi_ch_free_string(&conf->bdb_dbhome_directory);
+    slapi_ch_free_string(&conf->bdb_home_directory);
+    slapi_ch_free_string(&conf->bdb_compactdb_time);
+    slapi_ch_free_string(&conf->bdb_log_directory);
     *db = NULL;
     *env = NULL;
     return bdb_map_error(__FUNCTION__, rc);
@@ -7198,7 +7273,7 @@ bdb_dblayer_cursor_iterate(dbi_cursor_t *cursor, dbi_iterate_cb_t *action_cb,
     dbi_val_t key = {0};
     dbi_val_t data = {0};
     int rc = 0;
-    
+
     if (bdb_cur == NULL) {
         return  DBI_RC_INVALID;
     }

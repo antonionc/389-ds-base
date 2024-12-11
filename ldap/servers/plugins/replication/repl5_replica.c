@@ -1563,8 +1563,9 @@ replica_set_enabled(Replica *r, PRBool enable)
         }
         /* create supplier update event */
         if (r->repl_eqcxt_ka_update == NULL && replica_get_type(r) == REPLICA_TYPE_UPDATABLE) {
+            /* Should not create local update before the replica get a chance to resync after a restore/import */
             r->repl_eqcxt_ka_update = slapi_eq_repeat_rel(replica_subentry_update, r,
-                                                       slapi_current_rel_time_t() + START_UPDATE_DELAY,
+                                                       slapi_current_rel_time_t() + 2*PROTOCOL_BACKOFF_MAXIMUM,
                                                        1000 * replica_get_keepalive_update_interval(r));
         }
     } else /* disable */
@@ -1655,6 +1656,16 @@ replica_reload_ruv(Replica *r)
                 !ruv_covers_ruv(upper_bound_ruv, new_ruv)) {
 
                 /* We can't use existing changelog - remove existing file */
+                ruv_dump(new_ruv, "replica_reload_ruv database RUV", NULL);
+                ruv_dump(upper_bound_ruv, "replica_reload_ruv changelog RUV", NULL);
+                if (!ruv_covers_ruv(new_ruv, upper_bound_ruv)) {
+                     slapi_log_err(SLAPI_LOG_REPL, repl_plugin_name, "replica_reload_ruv - "
+                                   "changelog contains changes that are not in the databae.\n");
+                }
+                if (!ruv_covers_ruv(upper_bound_ruv, new_ruv)) {
+                     slapi_log_err(SLAPI_LOG_REPL, repl_plugin_name, "replica_reload_ruv - "
+                                   "database contains changes that are not in the changelog.\n");
+                }
                 slapi_log_err(SLAPI_LOG_WARNING, repl_plugin_name, "replica_reload_ruv - "
                         "New data for replica %s does not match the data in the changelog.\n "
                         "Recreating the changelog file. This could affect replication with replica's "
@@ -3683,7 +3694,7 @@ replica_log_ruv_elements_nolock(const Replica *r)
     /* we log it as a delete operation to have the least number of fields
            to set. the entry can be identified by a special target uniqueid and
            special target dn */
-    rc = ruv_enumerate_elements(ruv, replica_log_start_iteration, (void *)r);
+    rc = ruv_enumerate_elements(ruv, replica_log_start_iteration, (void *)r, 0 /* all_elements */);
     return rc;
 }
 
